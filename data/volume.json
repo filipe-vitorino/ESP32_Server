@@ -1,0 +1,21 @@
+{
+  "sensor_type": "volume",
+  "sensor_id": "volume_sensor_01",
+  "unit": "L",
+  "pin": 36,
+  "calibration": {
+    "vazio_value": 1149,
+    "cheio_value": 2750,
+    "valid_range": {"min": 0, "max": 100}
+  },
+  "valor_critico":{
+    "min": 0,
+    "max": 30
+  },
+  "sampling": {"period_sec": 900},
+  "ble": {
+    "service_uuid": "0000181a-0000-1000-8000-00805f9b34fb",
+    "characteristic_uuid": "C3261005-8070-4928-A2F2-F8386622423C"
+  },
+  "meta": {"label": "Bed A – Probe 1","version": 1}
+}

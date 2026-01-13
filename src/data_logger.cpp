@@ -1,233 +1,346 @@
 #include "data_logger.h"
 #include <ArduinoJson.h>
-#include "time.h"
+#include <LittleFS.h>
+#include <sys/time.h>
+#include <vector>
+// --- VARIÁVEIS DE ESTADO PARA O STREAMING ---
+static std::vector<String> _streamFilePaths;
+static int _currentStreamFileIndex = -1;
+static File _currentStreamFile;
+static bool _isFirstChunk = true;
 
-const char* LOG_FILE = "/historico.json";
-const char* TEMP_LOG_FILE = "/historico_temp.json";
-const int RETENTION_DAYS = 7;
-File logFileBLE;
+const char* LOG_DIR = "/logs";
+#define LOG_LINES_PER_BLOCK 50
+File logFileBLE; // Handle de ficheiro para leitura sequencial do BLE
 
-void pruneLogFile() {
-  Serial.println("Iniciando verificação de logs antigos...");
-  time_t now;
-  time(&now);
-  time_t cutoffTimestamp = now - (RETENTION_DAYS * 24 * 60 * 60);
-
-  File originalFile = SPIFFS.open(LOG_FILE, "r");
-  if (!originalFile) return;
-  File tempFile = SPIFFS.open(TEMP_LOG_FILE, "w");
-  if (!tempFile) { originalFile.close(); return; }
-
-  int recordsKept = 0, recordsDeleted = 0;
-  while(originalFile.available()) {
-    String line = originalFile.readStringUntil('\n');
-    if (line.length() > 2) {
-      StaticJsonDocument<200> doc;
-      deserializeJson(doc, line);
-      time_t recordTimestamp = doc["ts"];
-      if (recordTimestamp >= cutoffTimestamp) {
-        tempFile.println(line);
-        recordsKept++;
-      } else {
-        recordsDeleted++;
-      }
-    }
-  }
-  originalFile.close();
-  tempFile.close();
-
-  SPIFFS.remove(LOG_FILE);
-  SPIFFS.rename(TEMP_LOG_FILE, LOG_FILE);
-  Serial.printf("Limpeza concluída. Mantidos: %d, Apagados: %d\n", recordsKept, recordsDeleted);
-}
-
+// Inicializa LittleFS e cria diretório raiz
 void setupDataLogger() {
-  if (!SPIFFS.begin(true)) { Serial.println("Falha ao montar o SPIFFS!"); return; }
-  Serial.println("SPIFFS montado com sucesso.");
-  pruneLogFile(); 
+    if (!LittleFS.begin(true)) { // true -> formata se necessário
+        Serial.println("Falha ao montar o LittleFS!");
+        return;
+    }
+    Serial.println("LittleFS montado com sucesso.");
+
+    if (!LittleFS.exists(LOG_DIR)) {
+        if (LittleFS.mkdir(LOG_DIR)) {
+            Serial.println("Diretório de logs principal '/logs' criado.");
+        }
+    }
 }
 
-void logFakeSensorData() {
-  File file = SPIFFS.open(LOG_FILE, FILE_APPEND);
-  if (!file) { Serial.println("Falha ao abrir arquivo de log."); return; }
-  
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)) return;
-  time_t now;
-  time(&now);
+// Salva leitura de sensor em subpasta diária
+void logSensorReading(time_t now, const String& sensorId, const String& sensorType, const String& unit, int rawValue, float calibratedValue) {
 
-  StaticJsonDocument<200> doc;
-  doc["ts"] = now;
-  doc["vazao"] = random(100, 200) / 10.0;
-  doc["temperatura"] = random(200, 300) / 10.0;
-  
-  if (serializeJson(doc, file)) file.println();
-  file.close();
-  Serial.println("Novo registro de log salvo.");
-}
+    // Verifica hora válida
+    if (now < 1704067200) {
+        Serial.println("-> Hora inválida, log não será salvo.");
+        return;
+    }
 
-size_t streamLogFileChunked(uint8_t *buffer, size_t maxLen, size_t index) {
-  static File file;
-  static bool first;
-  static bool finished;
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
 
-  // index == 0 => início da stream (nova requisição)
-  if (index == 0) {
-    first = true;
-    finished = false;
-    if (file) { file.close(); } // garante que não haja handle aberto
-    extern const char* LOG_FILE;
-    file = SPIFFS.open(LOG_FILE, "r");
+    // Cria caminho do diretório diário
+    char dirPath[32];
+    sprintf(dirPath, "%s/%d_%02d_%02d", LOG_DIR, timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+
+    if (LittleFS.exists(dirPath)){
+      //Serial.printf("JA EXISTE: %s\n", dirPath);
+    }
+    // Cria diretório diário se não existir
+    if (!LittleFS.exists(dirPath)) {
+        if (LittleFS.mkdir(dirPath)) {
+           // Serial.printf("Novo diretório diário criado: %s\n", dirPath);
+        } else {
+           // Serial.printf("Falha ao criar diretório diário: %s\n", dirPath);
+            return;
+        }
+    }
+
+    // Caminho completo do arquivo do sensor
+    String filePath = String(dirPath) + "/" + sensorId + ".jsonl";
+
+    File file = LittleFS.open(filePath, FILE_APPEND);
     if (!file) {
-      // ficheiro não existe -> envia array vazio "[]"
-      const char *empty = "[]";
-      memcpy(buffer, empty, 2);
-      finished = true; // próxima chamada deve retornar 0 e encerrar definitivamente
-      return 2;
+        Serial.printf("Falha ao abrir o arquivo de log: %s\n", filePath.c_str());
+        return;
     }
-    // envia o '[' de abertura
-    buffer[0] = '[';
-    return 1;
-  }
 
-  // se já terminou (envio do ']'), faz cleanup e retorna 0 (fim)
-  if (finished) {
-    if (file) { file.close(); }
-    finished = false;
-    return 0;
-  }
+    // Cria objeto JSON
+    StaticJsonDocument<256> doc;
+    char isoTimestamp[21];
+    strftime(isoTimestamp, sizeof(isoTimestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
 
-  // lê até encontrar a próxima linha válida (pula linhas vazias / CR)
-  while (file && file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() <= 2) continue; // pula linhas vazias ou só \r
+    doc["ts"] = isoTimestamp;
+    doc["sensorId"] = sensorId;
+    doc["sensorType"] = sensorType;
+    doc["raw"] = rawValue;
+    doc["value"] = serialized(String(calibratedValue, 2));
+    doc["unit"] = unit;
 
-    if (!first) {
-      line = "," + line; // separador entre objetos JSON
+    if (serializeJson(doc, file)) {
+        file.println();
+        //Serial.printf("Registro salvo para '%s'\n", sensorId.c_str());
+    } else {
+        Serial.println("Falha ao escrever JSON no arquivo.");
     }
-    first = false;
 
-    size_t len = line.length();
-    if (len > maxLen) {
-      // se por acaso a linha for maior que o buffer, truncamos (melhorar se necessário)
-      len = maxLen;
-    }
-    memcpy(buffer, line.c_str(), len);
-    return len;
-  }
-
-  // não há mais dados -> fecha JSON com ']' e marca finished para a próxima chamada devolver 0
-  const char *end = "]";
-  memcpy(buffer, end, 1);
-  finished = true;
-  return 1;
-}
-
-
-void streamLogFile(AsyncResponseStream *response) {
-  File file = SPIFFS.open(LOG_FILE, "r");
-  if (!file || !file.size()) {
-    Serial.println("Ficheiro de log não encontrado ou vazio.");
-    response->print("[]");
-    // Não precisamos de `request->send(response)` aqui, pois o handler no wifi_handler.cpp fará isso.
-    return;
-  }
-
-  Serial.println("Iniciando stream cooperativo do ficheiro de log...");
-  response->print("[");
-  bool first = true;
-
-  // Cria um buffer de tamanho fixo na stack para ler cada linha
-  const size_t bufferSize = 256;
-  char lineBuffer[bufferSize];
-
-  while (file.available()) {
-    // Lê a próxima linha do ficheiro diretamente para o buffer, até ao '\n'
-    size_t bytesRead = file.readBytesUntil('\n', lineBuffer, bufferSize - 1);
-    
-    if (bytesRead > 0) {
-      // Adiciona o terminador nulo para tratar o buffer como uma string C válida
-      lineBuffer[bytesRead] = '\0';
-
-      // Espera até que haja espaço suficiente no buffer de envio da rede
-      // para a linha que acabámos de ler.
-      while(response->availableForWrite() < (bytesRead + 2)) {
-        // Enquanto espera, cede tempo ao sistema
-        delay(5);
-      }
-      
-      // Agora que há espaço, envia os dados
-      if (!first) {
-        response->print(",");
-      }
-      response->print(lineBuffer);
-      first = false;
-    }
-    
-    // Cede controlo ao sistema operativo a CADA iteração, mesmo que
-    // a leitura da linha seja muito rápida. Isto é crucial para o watchdog.
-    delay(0); 
-  }
-  
-  response->print("]");
-  file.close();
-  Serial.println("Stream do ficheiro de log concluído.");
-}
-
-String getLogPage(int page, int limit) {
-  File file = SPIFFS.open(LOG_FILE, "r");
-  if (!file || !file.size()) {
-    return "[]"; // Retorna um array vazio se não houver ficheiro ou estiver vazio
-  }
-
-  // Calcula quantos registos precisa de saltar para chegar à página certa
-  // Se page=1, não salta nenhum. Se page=2, salta 'limit' registos.
-  int recordsToSkip = (page - 1) * limit;
-
-  // Salta as linhas (registos) necessárias
-  for (int i = 0; i < recordsToSkip; i++) {
-    if (!file.available()) break; // Para se o ficheiro acabar antes
-    file.readStringUntil('\n');
-  }
-
-  String output = "[";
-  bool first = true;
-  for (int i = 0; i < limit; i++) {
-    if (!file.available()) break; // Para se o ficheiro acabar
-    String line = file.readStringUntil('\n');
-    if (line.length() > 2) { // Garante que a linha não está vazia
-      if (!first) {
-        output += ",";
-      }
-      output += line;
-      first = false;
-    }
-  }
-  output += "]";
-  file.close();
-  return output;
-}
-
-
-
-
-int getTotalRecords() {
-    File file = SPIFFS.open(LOG_FILE, "r");
-    if (!file) return 0;
-    int count = 0;
-    while(file.readStringUntil('\n').length() > 0) count++;
     file.close();
-    return count;
 }
 
-bool openLogFileForRead() { logFileBLE = SPIFFS.open(LOG_FILE, "r"); return logFileBLE; }
-String readNextLogEntry() { return (logFileBLE && logFileBLE.available()) ? logFileBLE.readStringUntil('\n') : ""; }
-void closeLogFile() { if (logFileBLE) logFileBLE.close(); }
+// Ajusta o relógio do ESP32
+void setSystemTime(time_t epochTime) {
+    struct timeval tv;
+    tv.tv_sec = epochTime;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
 
-void deleteLogFile() {
-  if (SPIFFS.remove(LOG_FILE)) {
-    Serial.println("Ficheiro de log apagado com sucesso por comando do app.");
-  } else {
-    Serial.println("Falha ao apagar o ficheiro de log.");
-  }
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)){
+        Serial.print("✅ ESP32: Hora do sistema acertada pelo app para: ");
+        Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+    }
+}
+
+// Em src/data_logger.cpp
+
+void deleteLogFiles() {
+    int totalCount = 0;
+    File root = LittleFS.open(LOG_DIR);
+    if (!root || !root.isDirectory()) {
+        Serial.println("❌ Falha ao abrir LOG_DIR ou não é diretório.");
+        return;
+    }
+
+    File dir = root.openNextFile();
+    while (dir) {
+        if (dir.isDirectory()) {
+            Serial.printf("📁 Diretório: %s\n", dir.name());
+
+            File f = dir.openNextFile();
+            while (f) {
+                if (!f.isDirectory()) {
+                    String filePath = String(LOG_DIR) + "/" + String(dir.name()) + "/" + f.name();
+                    Serial.printf("   🗑️ Deletando: %s\n", filePath.c_str());
+                    f.close();
+                    if (LittleFS.remove(filePath)) {
+                        Serial.println("   ✅ Arquivo deletado com sucesso.");
+                    } else {
+                        Serial.println("   ❌ Falha ao deletar arquivo.");
+                    }
+
+                    totalCount++;
+                }
+                
+                f = dir.openNextFile();
+            }
+
+            // Após deletar arquivos, pode remover o diretório também (opcional)
+            String dirPath = String(LOG_DIR) + "/" + String(dir.name());
+            if (LittleFS.rmdir(dirPath)) {
+                Serial.printf("📂 Diretório %s removido.\n", dirPath.c_str());
+            } else {
+                Serial.printf("⚠️ Não foi possível remover diretório %s.\n", dirPath.c_str());
+            }
+        }
+        dir.close();
+        dir = root.openNextFile();
+    }
+    root.close();
+
+    Serial.printf("ℹ️ Total de arquivos deletados: %d\n", totalCount);
+}
+
+
+// Conta total de registros em todos os arquivos de log
+int getTotalRecordsInAllFiles() {
+    int totalCount = 0;
+    File root = LittleFS.open(LOG_DIR);
+    if (!root || !root.isDirectory()) {
+        Serial.println("❌ Falha ao abrir LOG_DIR ou não é diretório.");
+        return 0;
+    }
+
+    File dir = root.openNextFile();
+    while(dir) {
+        if(dir.isDirectory()) {
+            Serial.printf("📁 Diretório: %s\n", dir.name());
+
+            File f = dir.openNextFile();
+            while(f) {
+                if(!f.isDirectory()) {
+                    Serial.printf("   📄 Arquivo: %s\n", f.name());
+
+                    while(f.available()) {
+                        String line = f.readStringUntil('\n');
+                        //Serial.printf("      📝 Linha lida: %s\n", line.c_str());
+                        if(line.length() > 2) totalCount++;
+                    }
+                }
+                f.close();
+                f = dir.openNextFile();
+            }
+        }
+        dir.close();
+        dir = root.openNextFile();
+    }
+    root.close();
+    Serial.printf("ℹ️ Total de registros encontrados: %d\n", totalCount);
+    return totalCount;
+}
+
+// Funções auxiliares para BLE
+bool openLogFileForRead(const String& filePath) {
+    logFileBLE = LittleFS.open(filePath, "r");
+    return logFileBLE;
+}
+
+String readNextLogEntry() {
+    return (logFileBLE && logFileBLE.available()) ? logFileBLE.readStringUntil('\n') : "";
+}
+
+void closeLogFile() {
+    if (logFileBLE) logFileBLE.close();
+}
+
+/// Obtém uma lista com o caminho absoluto de todos os ficheiros de log.
+std::vector<String> getAllLogFilePaths() {
+    std::vector<String> filePaths;
+    File root = LittleFS.open(LOG_DIR, "r");
+    if (!root || !root.isDirectory()) {
+        return filePaths;
+    }
+
+    File dateDir = root.openNextFile();
+    while(dateDir){
+        if(dateDir.isDirectory()){
+            File logDir = LittleFS.open(dateDir.name());
+            File logFile = logDir.openNextFile();
+            while(logFile){
+                if(!logFile.isDirectory() && String(logFile.name()).endsWith(".jsonl")){
+                    filePaths.push_back(String(logFile.name()));
+                }
+                logFile.close();
+                logFile = logDir.openNextFile();
+            }
+            logDir.close();
+        }
+        dateDir.close();
+        dateDir = root.openNextFile();
+    }
+    root.close();
+    return filePaths;
+}
+
+void streamFileJson(AsyncResponseStream* response, File &file, const String &filename) {
+    response->write("{\"file\":\"", 9);
+    response->write((const uint8_t*)filename.c_str(), filename.length());
+    response->write("\",\"content\":\"", 12);
+
+    const size_t bufSize = 256;
+    char buf[bufSize];
+    while(file.available()) {
+        size_t len = file.readBytes(buf, bufSize);
+        for(size_t i = 0; i < len; i++) {
+            char c = buf[i];
+            if(c == '"' || c == '\\') response->write('\\'); // escape JSON
+            response->write(c);
+        }
+    }
+
+    response->write("\"}\n", 3);
+}
+
+void prepareLogStream() {
+    Serial.println("Preparando stream de logs...");
+    _streamFilePaths.clear();
+    _currentStreamFileIndex = -1;
+    _isFirstChunk = true;
+
+    File root = LittleFS.open(LOG_DIR);
+    if (!root || !root.isDirectory()) return;
+
+    File dateDir = root.openNextFile();
+    while(dateDir){
+        if(dateDir.isDirectory()){
+            File logDir = LittleFS.open(dateDir.name());
+            File logFile = logDir.openNextFile();
+            while(logFile){
+                if(!logFile.isDirectory() && String(logFile.name()).endsWith(".jsonl")){
+                    _streamFilePaths.push_back(String(logFile.name()));
+                }
+                logFile.close();
+                logFile = logDir.openNextFile();
+            }
+            logDir.close();
+        }
+        dateDir.close();
+        dateDir = root.openNextFile();
+    }
+    root.close();
+    Serial.printf("Encontrados %d ficheiros de log para o stream.\n", _streamFilePaths.size());
+}
+
+size_t readLogStreamChunk(uint8_t *buffer, size_t maxLen) {
+    size_t bytesWritten = 0;
+
+    // Se for o primeiro pedaço de todos, envia o '[' de abertura do array JSON
+    if (_isFirstChunk) {
+        buffer[bytesWritten++] = '[';
+        _isFirstChunk = false;
+    }
+
+    while (bytesWritten < maxLen) {
+        // Se não houver ficheiro aberto, tenta abrir o próximo da lista
+        if (!_currentStreamFile) {
+            _currentStreamFileIndex++;
+            if (_currentStreamFileIndex >= _streamFilePaths.size()) {
+                // Não há mais ficheiros, termina o stream
+                break; 
+            }
+            _currentStreamFile = LittleFS.open(_streamFilePaths[_currentStreamFileIndex], "r");
+            if (!_currentStreamFile) continue;
+        }
+
+        // Se o ficheiro atual não tiver mais nada, fecha-o e passa para o próximo
+        if (!_currentStreamFile.available()) {
+            _currentStreamFile.close();
+            continue;
+        }
+
+        // Lê a próxima linha do ficheiro
+        String line = _currentStreamFile.readStringUntil('\n');
+        if (line.length() > 2) {
+            // Adiciona a vírgula se não for o primeiro elemento do array JSON
+            if (bytesWritten > 1) { // Maior que 1 para não adicionar vírgula depois do '[' inicial
+                if (bytesWritten + 1 < maxLen) {
+                    buffer[bytesWritten++] = ',';
+                } else break;
+            }
+
+            // Copia a linha para o buffer, se houver espaço
+            if (bytesWritten + line.length() < maxLen) {
+                memcpy(buffer + bytesWritten, line.c_str(), line.length());
+                bytesWritten += line.length();
+            } else {
+                // Se a linha não couber, volta a colocar no ficheiro e termina este chunk
+                _currentStreamFile.seek(_currentStreamFile.position() - line.length() - 1);
+                break;
+            }
+        }
+    }
+
+    // Se terminámos todos os ficheiros e ainda há espaço no buffer, envia o ']' de fecho
+    if (_currentStreamFileIndex >= _streamFilePaths.size() && bytesWritten + 1 < maxLen) {
+        buffer[bytesWritten++] = ']';
+        // Marca o índice como "superado" para indicar que terminámos
+        _currentStreamFileIndex++; 
+    }
+
+    // Se terminámos e não escrevemos nada (nem o '['), retorna 0
+    if (bytesWritten == 0 && _currentStreamFileIndex > _streamFilePaths.size()) {
+        return 0;
+    }
+
+    return bytesWritten;
 }
