@@ -1,0 +1,21 @@
+{
+  "sensor_type": "tds_sensor",
+  "sensor_id": "tds_sensor_01",
+  "unit": "ppm",
+  "pin": 33,
+  "calibration": {
+    "type": "polynomial",
+    "coefficients": [133.42, -255.86, 857.39, 0],
+    "valid_range": { "min": 10, "max": 2000 }
+  },
+  "valor_critico":{
+    "min": 0,
+    "max": 30
+  },
+  "sampling": {"period_sec": 900},
+  "ble": {
+    "service_uuid": "0000181a-0000-1000-8000-00805f9b34fb",
+    "characteristic_uuid": "C3261003-8070-4928-A2F2-F8386622423C"
+  },
+  "meta": {"label": "Bed A – Probe 1","version": 1}
+}

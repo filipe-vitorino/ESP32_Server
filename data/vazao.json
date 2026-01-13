@@ -1,0 +1,20 @@
+{
+  "sensor_type": "flow",
+  "sensor_id": "flow_sensor_01",
+  "unit": "L/min",
+  "pin": 19,
+  "calibration": {
+    "factor": 0.1,
+    "valid_range": {"min": 0, "max": 100}
+  },
+  "valor_critico":{
+    "min": 0,
+    "max": 30
+  },
+  "sampling": {"period_sec": 900},
+  "ble": {
+    "service_uuid": "0000181a-0000-1000-8000-00805f9b34fb",
+    "characteristic_uuid": "C3261001-8070-4928-A2F2-F8386622423C"
+  },
+  "meta": {"label": "Bed A – Probe 1","version": 1}
+}

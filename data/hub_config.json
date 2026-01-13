@@ -1,0 +1,11 @@
+{
+  "hub_id": "ESP32_HUB_01",
+  "hub_name": "Estufa Principal Bloco A",
+  "ble": {
+    "service_uuid": "edb8c71d-e270-48a5-a7d3-0f6cb0ccf2fa"
+  },
+  "location": {
+    "latitude": -19.9167,
+    "longitude": -43.9345
+  }
+}
