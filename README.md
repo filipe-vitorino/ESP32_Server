@@ -58,7 +58,7 @@ Antes de rodar o projeto, instale:
 ### 1. Clonar repositório
 
 ```bash
-git clone https://github.com/SEU-USUARIO/SEU-REPOSITORIO.git
+git clone https://github.com/filipe-vitorino/ESP32_Server.git
 cd SEU-REPOSITORIO
 ```
 
@@ -184,8 +184,4 @@ pio run
 
 Projeto embarcado desenvolvido com foco em IoT aplicada ao monitoramento hídrico, automação e aquisição inteligente de dados.
 
----
 
-## Autor
-
-Filipe Vitorino
